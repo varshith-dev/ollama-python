@@ -4,16 +4,18 @@ import json
 import os
 import re
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from httpx import Response as httpxResponse
 from pydantic import BaseModel
 from pytest_httpserver import HTTPServer, URIPattern
 from werkzeug.wrappers import Request, Response
 
-from ollama._client import CONNECTION_ERROR_MESSAGE, AsyncClient, Client, _copy_tools
+from ollama._client import CONNECTION_ERROR_MESSAGE, TIMEOUT_ERROR_MESSAGE, AsyncClient, Client, _copy_tools
 from ollama._types import Image, Message
 
 PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC'
@@ -1323,6 +1325,108 @@ def test_tool_validation():
   assert len(tools) == 1
   assert tools[0].type == 'custom_type'
   assert tools[0].function.name == 'test'
+
+
+def _expect_slow_chat(httpserver: HTTPServer, release: threading.Event) -> None:
+  def handler(request: Request) -> Response:
+    release.wait(5)
+    return Response(json.dumps({'model': 'm', 'message': {'role': 'assistant', 'content': 'ok'}, 'done': True}), status=200, content_type='application/json')
+
+  httpserver.expect_ordered_request('/api/chat', method='POST').respond_with_handler(handler)
+
+
+def _assert_read_timeout(exc_info: pytest.ExceptionInfo) -> None:
+  error = exc_info.value
+  assert type(error) is TimeoutError
+  assert str(error) == TIMEOUT_ERROR_MESSAGE
+  assert isinstance(error.__cause__, httpx.ReadTimeout)
+
+
+def test_client_timeout(httpserver: HTTPServer):
+  release = threading.Event()
+  _expect_slow_chat(httpserver, release)
+  client = Client(httpserver.url_for('/'), timeout=0.5)
+  try:
+    with pytest.raises(TimeoutError) as exc_info:
+      client.chat('model', messages=[{'role': 'user', 'content': 'prompt'}])
+    _assert_read_timeout(exc_info)
+  finally:
+    release.set()
+
+
+def test_client_timeout_stream(httpserver: HTTPServer):
+  release = threading.Event()
+  _expect_slow_chat(httpserver, release)
+  client = Client(httpserver.url_for('/'), timeout=0.5)
+  try:
+    with pytest.raises(TimeoutError) as exc_info:
+      for _ in client.chat('model', messages=[{'role': 'user', 'content': 'prompt'}], stream=True):
+        pass
+    _assert_read_timeout(exc_info)
+  finally:
+    release.set()
+
+
+async def test_async_client_timeout(httpserver: HTTPServer):
+  release = threading.Event()
+  _expect_slow_chat(httpserver, release)
+  client = AsyncClient(httpserver.url_for('/'), timeout=0.5)
+  try:
+    with pytest.raises(TimeoutError) as exc_info:
+      await client.chat('model', messages=[{'role': 'user', 'content': 'prompt'}])
+    _assert_read_timeout(exc_info)
+  finally:
+    release.set()
+
+
+async def test_async_client_timeout_stream(httpserver: HTTPServer):
+  release = threading.Event()
+  _expect_slow_chat(httpserver, release)
+  client = AsyncClient(httpserver.url_for('/'), timeout=0.5)
+  try:
+    with pytest.raises(TimeoutError) as exc_info:
+      async for _ in await client.chat('model', messages=[{'role': 'user', 'content': 'prompt'}], stream=True):
+        pass
+    _assert_read_timeout(exc_info)
+  finally:
+    release.set()
+
+
+@pytest.mark.parametrize('timeout_error', [httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout])
+@pytest.mark.parametrize('stream', [False, True])
+def test_client_wraps_timeout_exception(timeout_error: type, stream: bool):
+  def handle(request: httpx.Request) -> httpx.Response:
+    raise timeout_error('timed out')
+
+  client = Client(transport=httpx.MockTransport(handle))
+  with pytest.raises(TimeoutError) as exc_info:
+    response = client.chat('model', messages=[{'role': 'user', 'content': 'prompt'}], stream=stream)
+    if stream:
+      list(response)
+
+  error = exc_info.value
+  assert type(error) is TimeoutError
+  assert str(error) == TIMEOUT_ERROR_MESSAGE
+  assert isinstance(error.__cause__, timeout_error)
+
+
+@pytest.mark.parametrize('timeout_error', [httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout])
+@pytest.mark.parametrize('stream', [False, True])
+async def test_async_client_wraps_timeout_exception(timeout_error: type, stream: bool):
+  def handle(request: httpx.Request) -> httpx.Response:
+    raise timeout_error('timed out')
+
+  client = AsyncClient(transport=httpx.MockTransport(handle))
+  with pytest.raises(TimeoutError) as exc_info:
+    response = await client.chat('model', messages=[{'role': 'user', 'content': 'prompt'}], stream=stream)
+    if stream:
+      async for _ in response:
+        pass
+
+  error = exc_info.value
+  assert type(error) is TimeoutError
+  assert str(error) == TIMEOUT_ERROR_MESSAGE
+  assert isinstance(error.__cause__, timeout_error)
 
 
 def test_client_connection_error():
